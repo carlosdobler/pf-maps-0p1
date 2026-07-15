@@ -1,0 +1,14 @@
+[project]
+name = "pf-maps-0p1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dask[distributed]>=2026.7.0",
+    "gcsfs>=2026.7.0",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "xarray>=2026.4.0",
+    "zarr>=3.0",
+]
