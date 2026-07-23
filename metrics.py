@@ -11,6 +11,7 @@ function and the list of input variables it requires.
 
 from __future__ import annotations
 
+import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -29,38 +30,43 @@ def _annual_sum(condition: xr.DataArray) -> xr.DataArray:
 def _top_n_mean(da: xr.DataArray, n: int) -> xr.DataArray:
     """Annual mean of the n highest daily values.
 
-    Uses apply_ufunc with vectorize=True so each (lat, lon) pixel is processed
-    independently. Only the time dimension is rechunked to -1 (spatial chunks
-    stay at their native tile size) so each dask task receives the full time
-    series for its spatial tile without triggering a cross-worker reshuffle.
-    See CHUNKS in config.py for the resulting per-task memory tradeoff.
+    Each calendar year's top-n mean depends only on that year's values, so
+    there's no cross-year dependency to preserve. Rather than rechunking the
+    entire (multi-decade) time dimension to a single chunk — which would
+    force each dask task to hold the full time series for its spatial tile
+    in memory — we slice the data to one calendar year at a time and only
+    rechunk that (much smaller) slice to -1 before calling apply_ufunc. Each
+    per-year task then needs roughly
+    n_days_per_year * lat_chunk * lon_chunk * 4 bytes, about two orders of
+    magnitude less than the full-series approach, at the cost of a larger
+    dask graph (one task per spatial tile per year instead of one per
+    spatial tile). See CHUNKS in config.py.
     """
-    years = da.time.dt.year.values
-    unique_years = np.unique(years)
+    unique_years = np.unique(da.time.dt.year.values)
 
-    def _fn(x: np.ndarray) -> np.ndarray:
-        result = np.full(len(unique_years), np.nan)
-        for i, yr in enumerate(unique_years):
-            vals = x[years == yr]
-            valid = vals[~np.isnan(vals)]
-            if len(valid) > 0:
-                k = min(n, len(valid))
-                result[i] = np.mean(np.partition(valid, -k)[-k:])
-        return result
+    def _fn(x: np.ndarray) -> float:
+        valid = x[~np.isnan(x)]
+        if len(valid) == 0:
+            return np.nan
+        k = min(n, len(valid))
+        return np.mean(np.partition(valid, -k)[-k:])
 
-    result = xr.apply_ufunc(
-        _fn,
-        da.chunk({"time": -1}),
-        input_core_dims=[["time"]],
-        output_core_dims=[["year"]],
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[float],
-        dask_gufunc_kwargs={"output_sizes": {"year": len(unique_years)}},
-    )
-    return result.rename({"year": "time"}).assign_coords(
-        time=pd.to_datetime([f"{y}-01-01" for y in unique_years])
-    )
+    annual_results = []
+    for yr in unique_years:
+        da_year = da.sel(time=str(yr)).chunk({"time": -1})
+        result_year = xr.apply_ufunc(
+            _fn,
+            da_year,
+            input_core_dims=[["time"]],
+            vectorize=True,
+            dask="parallelized",
+            output_dtypes=[float],
+        )
+        annual_results.append(
+            result_year.expand_dims(time=[pd.Timestamp(f"{yr}-01-01")])
+        )
+
+    return xr.concat(annual_results, dim="time")
 
 
 # ─── tasmax metrics ───────────────────────────────────────────────────────────
@@ -186,59 +192,134 @@ def wettest_day(ds: dict[str, xr.DataArray]) -> xr.DataArray:
 def wettest_90_days(ds: dict[str, xr.DataArray]) -> xr.DataArray:
     """Maximum non-overlapping 90-day precipitation sum per year.
 
-    The 90-day rolling sum is computed over the full time series, so windows
-    can span calendar year boundaries (e.g. a window ending in January may
-    include days from the previous December). For each calendar year the window
-    whose end date falls within that year and whose sum is largest is selected,
-    subject to the constraint that it does not overlap with the previous year's
-    selected window.
+    The 90-day rolling sum can span calendar year boundaries (e.g. a window
+    ending in January may include days from the previous December), and each
+    year's selected window must not overlap the previous year's. Rather than
+    rechunking the entire multi-decade time dimension into a single chunk
+    (which forces each dask task to hold the full time series for its
+    spatial tile in memory), this is computed as a lazy chain of small
+    per-year tasks: for year Y we slice in only that year plus its trailing
+    89-day lookback buffer (~454 days total, versus the full series), and
+    thread the previous year's selected-window end date through the chain as
+    an ordinary (small, lat/lon-shaped) array argument. The non-overlap
+    comparison happens inside the per-pixel numpy function at runtime, so no
+    eager `.compute()` is needed to carry that state forward — the whole
+    per-year loop stays lazy, at the cost of a longer sequential dask-task
+    chain per spatial tile (years can no longer be computed concurrently for
+    a given tile, though different tiles remain fully parallel). Each task
+    now needs roughly
+    454 * lat_chunk * lon_chunk * 4 bytes, about two orders of magnitude
+    less than the full-series approach. See CHUNKS in config.py.
+
+    Note: this also fixes a latent bug in the previous full-series
+    implementation, where `np.argmax` over a candidate range containing NaN
+    rolling-sum values (from not yet having 90 days of history, e.g. in the
+    first calendar year of the record) could spuriously return a NaN
+    position -- producing a NaN result for that year and, since the bogus
+    position was carried forward as the "previous window" state, corrupting
+    the following year's non-overlap constraint too. Candidates with a NaN
+    rolling sum are now explicitly excluded.
+
+    Checkpointing: although each per-year task is small, `state` still forms
+    a single dask-graph dependency chain spanning the entire record (one
+    task per year per spatial tile, each depending on the last). Left fully
+    lazy, that unbounded chain -- combined with a single `xr.concat` + write
+    at the end -- lets completed-but-not-yet-consumed intermediate results
+    accumulate across all years and tiles before anything is flushed to
+    durable storage, which can exhaust local disk via dask's spill-to-disk
+    mechanism on a long run. To bound this, every `CHECKPOINT_EVERY_N_YEARS`
+    years we eagerly materialize (`dask.compute()`) *both* `state` and that
+    batch's annual sums together in a single call, then re-wrap each as a
+    small constant (re-chunked to match the input's spatial chunks for
+    `state`). Computing them jointly is essential: `state` and the annual
+    sum for a given year share the same upstream `apply_ufunc` task, so
+    computing only `state` and discarding the (still-lazy) sum would force
+    that entire upstream chain -- including re-reading the source data from
+    GCS -- to be redone later when the sum is finally needed, silently
+    doubling the work for every checkpointed year. Materializing both
+    together lets dask execute the shared graph exactly once.
     """
     precip = ds["pr"]
-    years = precip.time.dt.year.values
-    unique_years = np.unique(years)
+    unique_years = np.unique(precip.time.dt.year.values)
 
-    def _fn(x: np.ndarray) -> np.ndarray:
-        n = len(x)
-        result = np.full(len(unique_years), np.nan)
+    CHECKPOINT_EVERY_N_YEARS = 10
 
-        if np.all(np.isnan(x)):
-            return result
+    spatial_chunks = {
+        dim: precip.chunks[precip.get_axis_num(dim)][0]
+        for dim in precip.dims
+        if dim != "time"
+    }
 
-        # 90-day backward rolling sum via cumsum (NaN treated as 0)
-        filled = np.where(np.isnan(x), 0.0, x)
-        cs = np.concatenate([[0.0], np.cumsum(filled)])
-        runsum = np.full(n, np.nan)
-        runsum[89:] = cs[90:] - cs[: n - 89]
+    # Sentinel meaning "no previous window" -- guarantees the first year's
+    # candidates are unconstrained (day_offsets are real calendar day
+    # numbers since a fixed epoch, always >> this value).
+    SENTINEL = -1_000_000
 
-        prev_max_pos = -90
-        for i, yr in enumerate(unique_years):
-            positions = np.where(years == yr)[0]
-            valid_start = max(int(positions[0]), prev_max_pos + 90)
-            valid_end = int(positions[-1])
+    state = xr.zeros_like(precip.isel(time=0, drop=True), dtype=np.int64) + SENTINEL
 
-            if valid_start > valid_end:
-                continue
+    annual_sums = []
+    pending = []  # indices into annual_sums computed since the last checkpoint
+    for i, yr in enumerate(unique_years):
+        buffer_start = pd.Timestamp(f"{yr - 1}-12-31") - pd.Timedelta(days=89)
+        year_end = pd.Timestamp(f"{yr}-12-31")
+        da_year = precip.sel(time=slice(buffer_start, year_end)).chunk({"time": -1})
 
-            valid_range = np.arange(valid_start, valid_end + 1)
-            max_pos = int(valid_range[np.argmax(runsum[valid_range])])
-            result[i] = runsum[max_pos]
-            prev_max_pos = max_pos
+        local_dates = da_year["time"].values
+        day_offsets = local_dates.astype("datetime64[D]").astype(np.int64)
+        year_mask = pd.DatetimeIndex(local_dates).year.values == yr
+        n_local = len(local_dates)
 
-        return result
+        def _fn(
+            x: np.ndarray,
+            prev_state: np.int64,
+            day_offsets: np.ndarray = day_offsets,
+            year_mask: np.ndarray = year_mask,
+            n_local: int = n_local,
+        ) -> tuple[float, np.int64]:
+            if np.all(np.isnan(x)):
+                return np.nan, prev_state
 
-    result = xr.apply_ufunc(
-        _fn,
-        precip.chunk({"time": -1}),
-        input_core_dims=[["time"]],
-        output_core_dims=[["year"]],
-        vectorize=True,
-        dask="parallelized",
-        output_dtypes=[float],
-        dask_gufunc_kwargs={"output_sizes": {"year": len(unique_years)}},
-    )
-    return result.rename({"year": "time"}).assign_coords(
-        time=pd.to_datetime([f"{y}-01-01" for y in unique_years])
-    )
+            # 90-day backward rolling sum via cumsum (NaN treated as 0)
+            filled = np.where(np.isnan(x), 0.0, x)
+            cs = np.concatenate([[0.0], np.cumsum(filled)])
+            runsum = np.full(n_local, np.nan)
+            if n_local >= 90:
+                runsum[89:] = cs[90:] - cs[: n_local - 89]
+
+            candidates = (
+                year_mask & ~np.isnan(runsum) & (day_offsets >= prev_state + 90)
+            )
+            if not np.any(candidates):
+                return np.nan, prev_state
+
+            idx = np.where(candidates)[0]
+            best = idx[np.argmax(runsum[idx])]
+            return runsum[best], day_offsets[best]
+
+        result_year, state = xr.apply_ufunc(
+            _fn,
+            da_year,
+            state,
+            input_core_dims=[["time"], []],
+            output_core_dims=[[], []],
+            vectorize=True,
+            dask="parallelized",
+            output_dtypes=[float, np.int64],
+        )
+        annual_sums.append(result_year.expand_dims(time=[pd.Timestamp(f"{yr}-01-01")]))
+        pending.append(len(annual_sums) - 1)
+
+        if (i + 1) % CHECKPOINT_EVERY_N_YEARS == 0:
+            batch = xr.concat([annual_sums[j] for j in pending], dim="time")
+            batch, state_values = dask.compute(batch, state)
+            for offset, j in enumerate(pending):
+                annual_sums[j] = batch.isel(time=[offset])
+            state = xr.DataArray(
+                state_values, dims=state.dims, coords=state.coords
+            ).chunk(spatial_chunks)
+            pending = []
+
+    return xr.concat(annual_sums, dim="time")
 
 
 # ─── multi-variable metrics ───────────────────────────────────────────────────

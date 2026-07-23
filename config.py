@@ -11,14 +11,18 @@ GCS_OUTPUT_TEMPLATE = (
 )
 
 # Chunk sizes for opening input zarr stores (daily data).
-# For metrics that need the full time series per pixel (ten-hottest-*,
-# wettest-90-days), only the time dimension is rechunked to -1 — spatial
-# chunks are kept at their native 120x120 tile size.
 #
-# The tradeoff: each task for those metrics needs
-# n_timesteps * 120 * 120 * 4 bytes ≈ 2.9 GB. Limit concurrency accordingly
-# via `--n-workers` when running ten-hottest-*/wettest-90-days
-# (e.g. floor(available_RAM / 2.9 GB)).
+# ten-hottest-days/nights/wbmax-days and wettest-90-days all process one
+# calendar year at a time rather than rechunking the full time series to a
+# single chunk (see _top_n_mean and wettest_90_days in metrics.py). Each
+# task only needs roughly n_days_per_year * 120 * 120 * 4 bytes ≈ 21 MB
+# (up to ~454 days for wettest-90-days, to allow for its trailing lookback
+# buffer and non-overlap state across year boundaries, ≈ 26 MB), at the cost
+# of a larger dask graph (one task per spatial tile per year). --n-workers
+# no longer needs to be throttled for these metrics on that account. Since
+# per-task memory is now small, there's headroom to enlarge the spatial tile
+# size below to trade fewer/bigger tasks for reduced graph overhead — worth
+# revisiting once the current settings are validated.
 CHUNKS = {"time": 1000, "latitude": 120, "longitude": 120}
 
 # Chunk sizes for writing output zarr stores (annual data).
