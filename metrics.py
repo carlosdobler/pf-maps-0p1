@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from config import LAT_COORD
+from config import LAT_COORD, WB_PERCENTILE_FIRST_VALID_YEAR
 
 
 # ─── private helpers ──────────────────────────────────────────────────────────
@@ -330,6 +330,36 @@ def snowy_days(ds: dict[str, xr.DataArray]) -> xr.DataArray:
     return _annual_sum((ds["pr"] >= 1.0) & (ds["tas"] < 0.0))
 
 
+# ─── water balance percentile metrics ─────────────────────────────────────────
+
+
+def _drop_incomplete_first_year(da: xr.DataArray) -> xr.DataArray:
+    """Drop calendar year 1961, which lacks a full w12 lookback window.
+
+    wb_percentile uses a trailing 12-month rolling window, so Jan-Nov 1961
+    are NaN (no prior-year data to look back on) and Dec 1961 alone isn't a
+    meaningful annual aggregate. See WB_PERCENTILE_FIRST_VALID_YEAR in
+    config.py.
+    """
+    return da.sel(time=slice(str(WB_PERCENTILE_FIRST_VALID_YEAR), None))
+
+
+def average_water_balance(ds: dict[str, xr.DataArray]) -> xr.DataArray:
+    return _drop_incomplete_first_year(ds["wb_percentile"].resample(time="YS").mean())
+
+
+def probability_of_drought(ds: dict[str, xr.DataArray]) -> xr.DataArray:
+    return _drop_incomplete_first_year(
+        (ds["wb_percentile"] <= 30.0).resample(time="YS").mean()
+    )
+
+
+def probability_of_extreme_drought(ds: dict[str, xr.DataArray]) -> xr.DataArray:
+    return _drop_incomplete_first_year(
+        (ds["wb_percentile"] <= 5.0).resample(time="YS").mean()
+    )
+
+
 # ─── registry ─────────────────────────────────────────────────────────────────
 
 METRIC_REGISTRY: dict[str, dict] = {
@@ -371,4 +401,16 @@ METRIC_REGISTRY: dict[str, dict] = {
     "wettest-90-days": {"fn": wettest_90_days, "variables": ["pr"]},
     "snowy-days": {"fn": snowy_days, "variables": ["pr", "tas"]},
     "wettest-day": {"fn": wettest_day, "variables": ["pr"]},
+    "average-water-balance": {
+        "fn": average_water_balance,
+        "variables": ["wb_percentile"],
+    },
+    "probability-of-drought": {
+        "fn": probability_of_drought,
+        "variables": ["wb_percentile"],
+    },
+    "probability-of-extreme-drought": {
+        "fn": probability_of_extreme_drought,
+        "variables": ["wb_percentile"],
+    },
 }

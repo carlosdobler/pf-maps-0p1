@@ -1,11 +1,16 @@
-"""CLI entry point for computing annual climate stress metrics.
+"""CLI entry point for computing per-warming-level statistics.
+
+For each requested metric, reads its already-computed annual zarr store,
+slices 21-year windows centered on each warming level's year (from a wls_yrs
+CSV), computes summary statistics (nearest-rank quantiles + mean) per window,
+and writes the result to a new zarr store with `wl` and `stat` dimensions.
 
 Usage
 -----
-    python run.py days-above-32c
-    python run.py days-above-32c days-above-35c
-    python run.py all
-    python run.py --list
+    python compute_wl_stats.py days-above-32c
+    python compute_wl_stats.py days-above-32c days-above-35c
+    python compute_wl_stats.py all
+    python compute_wl_stats.py --list
 """
 
 from __future__ import annotations
@@ -32,8 +37,10 @@ warnings.filterwarnings(
     module="distributed",
 )
 
+from config import MODEL, SCENARIO, WLS_YRS_CSV_TEMPLATE
 from metrics import METRIC_REGISTRY
-from store import open_variable, save_metric
+from store import open_metric, save_wl_stats
+from wl_stats import compute_wl_diff, compute_wl_stats, load_warming_levels
 
 
 def _log(msg: str) -> None:
@@ -43,7 +50,10 @@ def _log(msg: str) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compute annual climate stress metrics from downscaled daily variables.",
+        description=(
+            "Compute per-warming-level statistics (nearest-rank quantiles + "
+            "mean over 21-year windows) from already-computed annual metrics."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Use --list to see all available metric names.",
     )
@@ -98,10 +108,8 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
         requested = args.metrics
 
-    # Collect required variables (deduplicated across all requested metrics)
-    needed_vars: set[str] = set()
-    for name in requested:
-        needed_vars.update(METRIC_REGISTRY[name]["variables"])
+    csv_path = WLS_YRS_CSV_TEMPLATE.format(model=MODEL, scenario=SCENARIO)
+    wl_table = load_warming_levels(csv_path)
 
     # Start local Dask cluster
     cluster = LocalCluster(
@@ -113,29 +121,15 @@ def main(argv: list[str] | None = None) -> None:
     _log(f"Dask dashboard: {client.dashboard_link}")
 
     try:
-        _log(f"Opening variable(s): {', '.join(sorted(needed_vars))}")
-        loaded = {var: open_variable(var) for var in needed_vars}
-
         for i, name in enumerate(requested, 1):
             _log(f"[{i}/{len(requested)}] Computing: {name}")
             t0 = datetime.now()
 
-            variables = METRIC_REGISTRY[name]["variables"]
-            fn = METRIC_REGISTRY[name]["fn"]
+            annual = open_metric(name)
+            result = compute_wl_stats(annual, wl_table)
+            diff_result = compute_wl_diff(result)
+            save_wl_stats(result, diff_result, name)
 
-            result = fn(loaded)
-
-            # Derive the land/ocean mask from the last time step of the first
-            # input variable. Computed eagerly — just one zarr chunk read.
-            # Uses the *last* step rather than the first because some
-            # variables have a warm-up period where even land cells are NaN
-            # at the start of the record (e.g. wb_percentile's w12 rolling
-            # window leaves Jan-Nov 1961 NaN everywhere) -- using time=0
-            # there would mask the entire global result to NaN.
-            complete = loaded[variables[0]].isel(time=-1).notnull().compute()
-            result = result.where(complete)
-
-            save_metric(result, name)
             elapsed = (datetime.now() - t0).total_seconds() / 60
             _log(f"[{i}/{len(requested)}] Done: {name} ({elapsed:.2f} min)")
 

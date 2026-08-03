@@ -8,12 +8,14 @@ import gcsfs
 import xarray as xr
 
 from config import (
-    CHUNKS,
     GCS_INPUT_TEMPLATE,
     GCS_OUTPUT_TEMPLATE,
+    GCS_WL_STATS_TEMPLATE,
     MODEL,
     OUT_CHUNKS,
     SCENARIO,
+    VARIABLE_SOURCES,
+    WL_OUT_CHUNKS,
 )
 
 
@@ -33,16 +35,54 @@ _UNIT_CONVERSIONS: dict[str, callable] = {
 
 
 def open_variable(variable: str) -> xr.DataArray:
-    """Open a daily climate variable from GCS as a lazy dask-backed DataArray.
+    """Open a climate variable from GCS as a lazy dask-backed DataArray.
+
+    The variable's source location and chunking are looked up in
+    VARIABLE_SOURCES, so this works for both daily variables (tasmax, tasmin,
+    tas, wetbulbmax, pr) and monthly ones (wb_percentile).
 
     Temperatures (tasmax, tasmin, tas) are converted from K to °C.
     Precipitation (pr) is converted from kg m⁻² s⁻¹ to mm/day.
     """
-    path = GCS_INPUT_TEMPLATE.format(var=variable, model=MODEL, scenario=SCENARIO)
+    src = VARIABLE_SOURCES[variable]
+    path = GCS_INPUT_TEMPLATE.format(
+        dir=src["dir"],
+        prefix=src["prefix"],
+        model=MODEL,
+        scenario=SCENARIO,
+        freq=src["freq"],
+    )
     fs = gcsfs.GCSFileSystem()
-    da = xr.open_zarr(fs.get_mapper(path), chunks=CHUNKS, consolidated=False)[variable]
+    da = xr.open_zarr(fs.get_mapper(path), chunks=src["chunks"], consolidated=False)[
+        variable
+    ]
     if variable in _UNIT_CONVERSIONS:
         da = _UNIT_CONVERSIONS[variable](da)
+    return da
+
+
+def open_metric(metric: str) -> xr.DataArray:
+    """Open a previously-computed annual metric from GCS as a lazy DataArray.
+
+    Symmetric to `open_variable()`, but reads back an annual metric written by
+    `save_metric()` (via `GCS_OUTPUT_TEMPLATE`) rather than a raw daily input
+    variable.
+    """
+    path = GCS_OUTPUT_TEMPLATE.format(metric=metric, model=MODEL, scenario=SCENARIO)
+    fs = gcsfs.GCSFileSystem()
+    var_name = metric.replace("-", "_")
+    da = xr.open_zarr(fs.get_mapper(path), chunks=OUT_CHUNKS, consolidated=False)[
+        var_name
+    ]
+
+    # Drop non-dimension coordinates (e.g. a scalar 'height' coordinate
+    # carried over from the source tasmax/tasmin/tas/... input) so they don't
+    # propagate into downstream outputs derived from this DataArray, such as
+    # the warming-level stats written by save_wl_stats().
+    extra_coords = [c for c in da.coords if c not in da.dims]
+    if extra_coords:
+        da = da.drop_vars(extra_coords)
+
     return da
 
 
@@ -92,3 +132,52 @@ def save_metric(da: xr.DataArray, metric: str) -> None:
                 consolidated=False,
             )
         _log(f"  wrote batch {i}/{n_batches}")
+
+
+def save_wl_stats(da: xr.DataArray, diff_da: xr.DataArray, metric: str) -> None:
+    """Write per-warming-level statistics and their diff-from-baseline to GCS.
+
+    `da` and `diff_da` are expected to have matching dims (wl, stat,
+    latitude, longitude) and share the same `wl` coordinate -- `diff_da` is
+    derived from `da` (see `wl_stats.compute_wl_diff()`). Both are written
+    as separate data variables in the same zarr store. As with
+    `save_metric()`, this writes incrementally rather than in one `to_zarr()`
+    call -- here, one warming level at a time via `append_dim="wl"` -- to
+    bound how much computed-but-unwritten data can accumulate in worker
+    memory/spill before being flushed. Each warming level's stats depend on a
+    full 21-year window of the (spatially-chunked) annual metric, so, as with
+    `save_metric()`, this is not atomic: an interrupted run leaves a partial
+    output store (leading warming levels written, the rest missing).
+
+    The main variable is named using the metric name with hyphens replaced
+    by underscores; the diff variable is that name prefixed with `diff_`.
+    """
+    path = GCS_WL_STATS_TEMPLATE.format(metric=metric, model=MODEL, scenario=SCENARIO)
+    fs = gcsfs.GCSFileSystem()
+    var_name = metric.replace("-", "_")
+    diff_var_name = f"diff_{var_name}"
+
+    da = da.chunk(WL_OUT_CHUNKS)
+    diff_da = diff_da.chunk(WL_OUT_CHUNKS)
+    n_wl = da.sizes["wl"]
+
+    for i in range(n_wl):
+        batch = xr.Dataset(
+            {
+                var_name: da.isel(wl=slice(i, i + 1)),
+                diff_var_name: diff_da.isel(wl=slice(i, i + 1)),
+            }
+        )
+        if i == 0:
+            batch.to_zarr(
+                fs.get_mapper(path), mode="w", zarr_format=3, consolidated=False
+            )
+        else:
+            batch.to_zarr(
+                fs.get_mapper(path),
+                mode="a",
+                append_dim="wl",
+                zarr_format=3,
+                consolidated=False,
+            )
+        _log(f"  wrote wl batch {i + 1}/{n_wl}")
