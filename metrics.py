@@ -88,6 +88,10 @@ def days_above_45c(ds: dict[str, xr.DataArray]) -> xr.DataArray:
     return _annual_sum(ds["tasmax"] >= 45.0)
 
 
+def days_above_50c(ds: dict[str, xr.DataArray]) -> xr.DataArray:
+    return _annual_sum(ds["tasmax"] >= 50.0)
+
+
 def average_daytime_temperature(ds: dict[str, xr.DataArray]) -> xr.DataArray:
     return ds["tasmax"].resample(time="YS").mean()
 
@@ -367,6 +371,7 @@ METRIC_REGISTRY: dict[str, dict] = {
     "days-above-35c": {"fn": days_above_35c, "variables": ["tasmax"]},
     "days-above-38c": {"fn": days_above_38c, "variables": ["tasmax"]},
     "days-above-45c": {"fn": days_above_45c, "variables": ["tasmax"]},
+    "days-above-50c": {"fn": days_above_50c, "variables": ["tasmax"]},
     "average-temperature": {"fn": average_temperature, "variables": ["tas"]},
     "average-daytime-temperature": {
         "fn": average_daytime_temperature,
